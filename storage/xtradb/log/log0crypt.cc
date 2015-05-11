@@ -129,11 +129,11 @@ log_blocks_crypt(
 {
 	byte *log_block = (byte*)block;
 	Crypt_result rc = MY_AES_OK;
-	uint32 dst_len;
+	uint dst_len;
 	byte aes_ctr_counter[MY_AES_BLOCK_SIZE];
 	ulint lsn = is_encrypt ? log_sys->lsn : srv_start_lsn;
 
-	const int src_len = OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE;
+	const uint src_len = OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE;
 	for (ulint i = 0; i < size ; i += OS_FILE_LOG_BLOCK_SIZE) {
 		ulint log_block_no = log_block_get_hdr_no(log_block);
 		ulint log_block_start_lsn = log_block_get_start_lsn(
@@ -442,7 +442,7 @@ log_crypt_write_checkpoint_buf(
 #else
 	(void)checkpoint_no; // unused variable
 #endif
-        ut_a((buf - save) <= OS_FILE_LOG_BLOCK_SIZE);
+        ut_a((ulint)(buf - save) <= OS_FILE_LOG_BLOCK_SIZE);
 }
 
 /*********************************************************************//**

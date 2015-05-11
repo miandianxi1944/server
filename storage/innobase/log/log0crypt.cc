@@ -129,7 +129,7 @@ log_blocks_crypt(
 {
 	byte *log_block = (byte*)block;
 	Crypt_result rc = MY_AES_OK;
-	uint32 dst_len;
+	uint dst_len;
 	byte aes_ctr_counter[MY_AES_BLOCK_SIZE];
 	ulint lsn = is_encrypt ? log_sys->lsn : srv_start_lsn;
 
@@ -442,7 +442,7 @@ log_crypt_write_checkpoint_buf(
 #else
 	(void)checkpoint_no; // unused variable
 #endif
-        ut_a((buf - save) <= OS_FILE_LOG_BLOCK_SIZE);
+        ut_a((ulint)(buf - save) <= OS_FILE_LOG_BLOCK_SIZE);
 }
 
 /*********************************************************************//**
