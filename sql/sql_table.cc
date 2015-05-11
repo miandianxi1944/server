@@ -2317,9 +2317,6 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
           . "DROP" was executed but a temporary table was affected (.i.e
           !error).
       */
-#ifndef DONT_LOG_DROP_OF_TEMPORARY_TABLES
-      table_creation_was_logged= 1;
-#endif
       if (!dont_log_query && table_creation_was_logged)
       {
         /*
@@ -4682,9 +4679,6 @@ int create_table_impl(THD *thd,
         We have to log this query, even if it failed later to ensure the
         drop is done.
       */
-#ifndef DONT_LOG_DROP_OF_TEMPORARY_TABLES
-      table_creation_was_logged= 1;
-#endif
       if (table_creation_was_logged)
       {
         thd->variables.option_bits|= OPTION_KEEP_LOG;
