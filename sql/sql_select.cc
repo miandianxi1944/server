@@ -760,12 +760,17 @@ JOIN::prepare(Item ***rref_pointer_array,
   }
 
   table_count= select_lex->leaf_tables.elements;
- 
+
   TABLE_LIST *tbl;
   List_iterator_fast<TABLE_LIST> li(select_lex->leaf_tables);
+  /*
+    If all tables comes from the same storage engine, one_storge_engine will
+    be set to point to the handlerton of this engine.
+  */
+  one_storage_engine= 0;
+  uint table_loop_count= 0;
   while ((tbl= li++))
   {
-    //table_count++; /* Count the number of tables in the join. */
     /*
       If the query uses implicit grouping where the select list contains both
       aggregate functions and non-aggregate fields, any non-aggregated field
@@ -775,8 +780,17 @@ JOIN::prepare(Item ***rref_pointer_array,
       Note: this loop doesn't touch tables inside merged semi-joins, because
       subquery-to-semijoin conversion has not been done yet. This is intended.
     */
-    if (mixed_implicit_grouping && tbl->table)
-      tbl->table->maybe_null= 1;
+    if (tbl->table)
+    {
+      if (mixed_implicit_grouping)
+        tbl->table->maybe_null= 1;
+      if (!table_loop_count++)
+        one_storage_engine= tbl->table->file->ht;
+      else if (one_storage_engine != tbl->table->file->ht)
+        one_storage_engine= 0;
+    }
+    else
+      one_storage_engine= 0;
   }
 
   if ((wild_num && setup_wild(thd, tables_list, fields_list, &all_fields,
@@ -809,8 +823,9 @@ JOIN::prepare(Item ***rref_pointer_array,
     thd->lex->allow_sum_func|= (nesting_map)1 << select_lex_arg->nest_level;
     select_lex->having_fix_field= 1;
     /*
-      Wrap alone field in HAVING clause in case it will be outer field of subquery
-      which need persistent pointer on it, but having could be changed by optimizer
+      Wrap alone field in HAVING clause in case it will be outer field
+      of subquery which need persistent pointer on it, but having
+      could be changed by optimizer
     */
     if (having->type() == Item::REF_ITEM &&
         ((Item_ref *)having)->ref_type() == Item_ref::REF)
@@ -1102,8 +1117,8 @@ JOIN::optimize_inner()
     before 'optimize' from upper query 'optimize' to allow semijoin
     conversion happened (which done in the same way.
   */
-  if(select_lex->first_cond_optimization &&
-     conds && conds->walk(&Item::exists2in_processor, 0, (uchar *)thd))
+  if (select_lex->first_cond_optimization &&
+      conds && conds->walk(&Item::exists2in_processor, 0, (uchar *)thd))
     DBUG_RETURN(1);
   /*
 TODO: make view to decide if it is possible to write to WHERE directly or make Semi-Joins able to process ON condition if it is possible
@@ -1880,6 +1895,102 @@ TODO: make view to decide if it is possible to write to WHERE directly or make S
   if ((select_lex->options & OPTION_SCHEMA_TABLE))
     optimize_schema_tables_reads(this);
 
+  /*
+    All optimization is done. Check if we can use the storage engines
+    group by handler to evaluate the group by
+  */
+
+  if ((tmp_table_param.sum_func_count || group_list) && !procedure &&
+      (one_storage_engine && one_storage_engine->create_group_by))
+  {
+    /* Check if the storage engine can intercept the query */
+    if ((storage_handler_for_group_by=
+         (one_storage_engine->create_group_by)(thd, select_lex,
+                                               &all_fields,
+                                               tables_list,
+                                               group_list, order,
+                                               conds, having)))
+    {
+      uint handler_flags= storage_handler_for_group_by->flags();
+      int err;
+      
+      /*
+        We must store rows in the tmp table if we need to do an ORDER BY
+        or DISTINCT and the storage handler can't handle it.
+      */
+      need_tmp= ((!(handler_flags & GROUP_BY_ORDER_BY) &&
+                  (order || group_list)) ||
+                 (!(handler_flags & GROUP_BY_DISTINCT) && select_distinct));
+      tmp_table_param.hidden_field_count= (all_fields.elements -
+                                           fields_list.elements);
+      if (!(exec_tmp_table1=
+            create_tmp_table(thd, &tmp_table_param, all_fields,
+                             0, handler_flags & GROUP_BY_DISTINCT ?
+                             0 : select_distinct, 1,
+                             select_options, HA_POS_ERROR, "",
+                             !need_tmp,
+                             (!order ||
+                              (handler_flags & GROUP_BY_ORDER_BY)))))
+        DBUG_RETURN(1);
+
+      /*
+        Setup reference fields, used by summary functions and group by fields,
+        to point to the temporary table.
+        The actual switching to the temporary tables fields for HAVING
+        and ORDER BY is done in do_select() by calling
+        set_items_ref_array(items1).
+      */
+      init_items_ref_array();
+      items1= items0 + all_fields.elements;
+      if (change_to_use_tmp_fields(thd, items1,
+                                   tmp_fields_list1, tmp_all_fields1,
+                                   fields_list.elements, all_fields))
+        DBUG_RETURN(1);
+
+      /* Give storage engine access to temporary table */
+      if ((err= storage_handler_for_group_by->init(exec_tmp_table1,
+                                                   having, order)))
+      {
+        storage_handler_for_group_by->print_error(err, MYF(0));
+        DBUG_RETURN(1);
+      }
+      storage_handler_for_group_by->store_data_in_temp_table= need_tmp;
+      /*
+        If there is not specified ORDER BY, we should sort things according
+        to the group_by
+      */
+      if (!order)
+        order= group_list;
+      /*
+        Group by and having is calculated by the group_by handler.
+        Reset the group by and having
+      */
+      group= 0; group_list= 0;
+      having= tmp_having= 0;
+      /*
+        Select distinct is handled by handler or by creating an unique index
+        over all fields in the temporary table
+      */
+      select_distinct= 0;
+      if (handler_flags & GROUP_BY_ORDER_BY)
+        order= 0;
+      tmp_table_param.field_count+= tmp_table_param.sum_func_count;
+      tmp_table_param.sum_func_count= 0;
+
+      /* Remember information about the original join */
+      original_join_tab= join_tab;
+      original_table_count= table_count;
+
+      /* Set up one join tab to get sorting to work */
+      const_tables= 0;
+      table_count= 1;
+      join_tab= (JOIN_TAB*) thd->calloc(sizeof(JOIN_TAB));
+      join_tab[0].table= exec_tmp_table1;
+
+      DBUG_RETURN(thd->is_fatal_error);
+    }
+  }
+
   tmp_having= having;
   if (select_options & SELECT_DESCRIBE)
   {
@@ -1948,8 +2059,9 @@ int JOIN::init_execution()
   /*
     Enable LIMIT ROWS EXAMINED during query execution if:
     (1) This JOIN is the outermost query (not a subquery or derived table)
-        This ensures that the limit is enabled when actual execution begins, and
-        not if a subquery is evaluated during optimization of the outer query.
+        This ensures that the limit is enabled when actual execution begins,
+        and not if a subquery is evaluated during optimization of the outer
+        query.
     (2) This JOIN is not the result of a UNION. In this case do not apply the
         limit in order to produce the partial query result stored in the
         UNION temp table.
@@ -1959,7 +2071,7 @@ int JOIN::init_execution()
     thd->lex->set_limit_rows_examined();
 
   /* Create a tmp table if distinct or if the sort is too complicated */
-  if (need_tmp)
+  if (need_tmp && ! storage_handler_for_group_by)
   {
     DBUG_PRINT("info",("Creating tmp table"));
     THD_STAGE_INFO(thd, stage_copying_to_tmp_table);
@@ -2523,9 +2635,10 @@ void JOIN::exec_inner()
   }
 
   /*
-    Evaluate all constant expressions with subqueries in the ORDER/GROUP clauses
-    to make sure that all subqueries return a single row. The evaluation itself
-    will trigger an error if that is not the case.
+    Evaluate all constant expressions with subqueries in the
+    ORDER/GROUP clauses to make sure that all subqueries return a
+    single row. The evaluation itself will trigger an error if that is
+    not the case.
   */
   if (exec_const_order_group_cond.elements &&
       !(select_options & SELECT_DESCRIBE))
@@ -2610,6 +2723,8 @@ void JOIN::exec_inner()
     iteration must count from zero.
   */
   curr_join->examined_rows= 0;
+
+  curr_join->do_select_call_count= 0;
 
   /* Create a tmp table if distinct or if the sort is too complicated */
   if (need_tmp)
@@ -2743,7 +2858,6 @@ void JOIN::exec_inner()
 	(curr_join->tmp_all_fields1.elements-
 	 curr_join->tmp_fields_list1.elements);
       
-      
       if (exec_tmp_table2)
 	curr_tmp_table= exec_tmp_table2;
       else
@@ -2858,7 +2972,6 @@ void JOIN::exec_inner()
     if (curr_tmp_table->distinct)
       curr_join->select_distinct=0;		/* Each row is unique */
     
-
     curr_join->join_free();			/* Free quick selects */
 
     if (curr_join->select_distinct && ! curr_join->group_list)
@@ -11384,14 +11497,16 @@ void JOIN_TAB::cleanup()
       }
       else
       {
+        TABLE_LIST *tmp= table->pos_in_table_list;
         end_read_record(&read_record);
-        table->pos_in_table_list->jtbm_subselect->cleanup();
+        tmp->jtbm_subselect->cleanup();
         /* 
           The above call freed the materializedd temptable. Set it to NULL so
           that we don't attempt to touch it if JOIN_TAB::cleanup() is invoked
           multiple times (it may be)
         */
-        table=NULL;
+        tmp->table= NULL;
+        table= NULL;
       }
       DBUG_VOID_RETURN;
     }
@@ -11734,6 +11849,14 @@ void JOIN::cleanup(bool full)
   if (full)
     have_query_plan= QEP_DELETED;
 
+  if (original_join_tab)
+  {
+    /* Free the original optimized join created for the group_by_handler */
+    join_tab= original_join_tab;
+    original_join_tab= 0;
+    table_count= original_table_count;
+  }
+  
   if (table)
   {
     JOIN_TAB *tab;
@@ -11796,7 +11919,6 @@ void JOIN::cleanup(bool full)
         }
       }
       cleaned= true;
-
     }
     else
     {
@@ -11848,6 +11970,9 @@ void JOIN::cleanup(bool full)
         tmp_join->tmp_table_param.save_copy_field= 0;
     }
     tmp_table_param.cleanup();
+
+    delete storage_handler_for_group_by;
+    storage_handler_for_group_by= 0;
 
     if (!join_tab)
     {
@@ -15849,11 +15974,15 @@ void setup_tmp_table_column_bitmaps(TABLE *table, uchar *bitmaps)
   @param param                a description used as input to create the table
   @param fields               list of items that will be used to define
                               column types of the table (also see NOTES)
-  @param group                TODO document
+  @param group                Create an unique key over all group by fields.
+                              This is used to retrive the row during
+                              end_write_group() and update them.
   @param distinct             should table rows be distinct
   @param save_sum_fields      see NOTES
-  @param select_options
-  @param rows_limit
+  @param select_options       Optiions for how the select is run.
+                              See sql_priv.h for a list of options.
+  @param rows_limit           Maximum number of rows to insert into the
+                              temporary table
   @param table_alias          possible name of the temporary table that can
                               be used for name resolving; can be "".
 */
@@ -16153,9 +16282,9 @@ create_tmp_table(THD *thd, TMP_TABLE_PARAM *param, List<Item> &fields,
                          /*
                            If item->marker == 4 then we force create_tmp_field
                            to create a 64-bit longs for BIT fields because HEAP
-                           tables can't index BIT fields directly. We do the same
-                           for distinct, as we want the distinct index to be
-                           usable in this case too.
+                           tables can't index BIT fields directly. We do the
+                           same for distinct, as we want the distinct index
+                           to be usable in this case too.
                          */
                          item->marker == 4  || param->bit_fields_as_long,
                          force_copy_fields,
@@ -16175,16 +16304,19 @@ create_tmp_table(THD *thd, TMP_TABLE_PARAM *param, List<Item> &fields,
           created temporary table is not to be used for subquery
           materialization.
 
-          The reason is that for subqueries that require materialization as part
-          of their plan, we create the 'external' temporary table needed for IN
-          execution, after the 'internal' temporary table needed for grouping.
-          Since both the external and the internal temporary tables are created
-          for the same list of SELECT fields of the subquery, setting
-          'result_field' for each invocation of create_tmp_table overrides the
-           previous value of 'result_field'.
+          The reason is that for subqueries that require
+          materialization as part of their plan, we create the
+          'external' temporary table needed for IN execution, after
+          the 'internal' temporary table needed for grouping.  Since
+          both the external and the internal temporary tables are
+          created for the same list of SELECT fields of the subquery,
+          setting 'result_field' for each invocation of
+          create_tmp_table overrides the previous value of
+          'result_field'.
 
-          The condition below prevents the creation of the external temp table
-          to override the 'result_field' that was set for the internal temp table.
+          The condition below prevents the creation of the external
+          temp table to override the 'result_field' that was set for
+          the internal temp table.
         */
         if (!agg_item->result_field || !param->materialized_subquery)
           agg_item->result_field= new_field;
@@ -17491,6 +17623,7 @@ Next_select_func setup_end_select_func(JOIN *join)
   @retval
     -1  if error should be sent
 */
+
 static int
 do_select(JOIN *join,List<Item> *fields,TABLE *table,Procedure *procedure)
 {
@@ -17502,7 +17635,19 @@ do_select(JOIN *join,List<Item> *fields,TABLE *table,Procedure *procedure)
   join->procedure=procedure;
   join->tmp_table= table;			/* Save for easy recursion */
   join->fields= fields;
+  join->do_select_call_count++;
 
+  if (join->storage_handler_for_group_by &&
+      join->do_select_call_count == 1)
+  {
+    /* Select fields are in the temporary table */
+    join->fields= &join->tmp_fields_list1;
+    /* Setup HAVING to work with fields in temporary table */
+    join->set_items_ref_array(join->items1);
+    /* The storage engine will take care of the group by query result */
+    DBUG_RETURN(join->storage_handler_for_group_by->execute(join));
+  }
+  
   if (table)
   {
     (void) table->file->extra(HA_EXTRA_WRITE_CACHE);
@@ -17658,12 +17803,14 @@ int rr_sequential_and_unpack(READ_RECORD *info)
 
 
 /*
-  Fill the join buffer with partial records, retrieve all full  matches for them   
+  Fill the join buffer with partial records, retrieve all full matches for
+  them   
 
   SYNOPSIS
     sub_select_cache()
-      join     pointer to the structure providing all context info for the query
-      join_tab the first next table of the execution plan to be retrieved
+      join         pointer to the structure providing all context info for the
+                   query
+      join_tab     the first next table of the execution plan to be retrieved
       end_records  true when we need to perform final steps of the retrieval
 
   DESCRIPTION
@@ -20840,8 +20987,9 @@ create_sort_index(THD *thd, JOIN *join, ORDER *order,
   if (join->pre_sort_join_tab)
   {
     /*
-      we've already been in this function, and stashed away the original access 
-      method in join->pre_sort_join_tab, restore it now.
+      we've already been in this function, and stashed away the
+      original access method in join->pre_sort_join_tab, restore it
+      now.
     */
     
     /* First, restore state of the handler */
@@ -22533,9 +22681,10 @@ change_to_use_tmp_fields(THD *thd, Item **ref_pointer_array,
       if (field != NULL)
       {
         /*
-          Replace "@:=<expression>" with "@:=<tmp table column>". Otherwise, we
-          would re-evaluate <expression>, and if expression were a subquery, this
-          would access already-unlocked tables.
+          Replace "@:=<expression>" with "@:=<tmp table
+          column>". Otherwise, we would re-evaluate <expression>, and
+          if expression were a subquery, this would access
+          already-unlocked tables.
          */
         Item_func_set_user_var* suv=
           new Item_func_set_user_var(thd, (Item_func_set_user_var*) item);
@@ -22543,10 +22692,11 @@ change_to_use_tmp_fields(THD *thd, Item **ref_pointer_array,
         if (!suv || !new_field)
           DBUG_RETURN(true);                  // Fatal error
         /*
-         We are replacing the argument of Item_func_set_user_var after its value
-         has been read.  The argument's null_value should be set by now, so we
-         must set it explicitly for the replacement argument since the null_value
-         may be read without any preceding call to val_*().
+         We are replacing the argument of Item_func_set_user_var after
+         its value has been read.  The argument's null_value should be
+         set by now, so we must set it explicitly for the replacement
+         argument since the null_value may be read without any
+         preceeding call to val_*().
         */
         new_field->update_null_value();
         List<Item> list;
@@ -23909,8 +24059,26 @@ int JOIN::save_explain_data_intern(Explain_query *output, bool need_tmp_table,
 
     explain->select_id= join->select_lex->select_number;
     explain->select_type= join->select_lex->type;
+    explain->using_temporary= need_tmp;
+    explain->using_filesort=  need_order;
     /* Setting explain->message means that all other members are invalid */
     explain->message= message;
+
+    if (select_lex->master_unit()->derived)
+      explain->connection_type= Explain_node::EXPLAIN_NODE_DERIVED;
+    output->add_node(explain);
+  }
+  else if (storage_handler_for_group_by)
+  {
+    explain= new (output->mem_root) Explain_select(output->mem_root, 
+                                                   thd->lex->analyze_stmt);
+    select_lex->set_explain_type(true);
+
+    explain->select_id=   select_lex->select_number;
+    explain->select_type= select_lex->type;
+    explain->using_temporary= need_tmp;
+    explain->using_filesort=  need_order;
+    explain->message= "Storage engine handles GROUP BY";
 
     if (select_lex->master_unit()->derived)
       explain->connection_type= Explain_node::EXPLAIN_NODE_DERIVED;
