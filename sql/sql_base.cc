@@ -4174,12 +4174,6 @@ end:
   DBUG_RETURN(error);
 }
 
-extern "C" uchar *schema_set_get_key(const TABLE_LIST *table, size_t *length,
-                                     my_bool not_used __attribute__((unused)))
-{
-  *length= table->db_length;
-  return (uchar*) table->db;
-}
 
 /**
   Acquire upgradable (SNW, SNRW) metadata locks on tables used by
@@ -4217,7 +4211,6 @@ lock_table_names(THD *thd, const DDL_options_st &options,
   MDL_request_list mdl_requests;
   TABLE_LIST *table;
   MDL_request global_request;
-  Hash_set<TABLE_LIST> schema_set(schema_set_get_key);
   ulong org_lock_wait_timeout= lock_wait_timeout;
   /* Check if we are using CREATE TABLE ... IF NOT EXISTS */
   bool create_table;
@@ -4243,9 +4236,17 @@ lock_table_names(THD *thd, const DDL_options_st &options,
       DBUG_RETURN(true);
     }
 
-    if (! (flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK) &&
-        schema_set.insert(table))
-      DBUG_RETURN(TRUE);
+    /* Scoped locks: Take intention exclusive locks on all involved schemas. */
+    if (!(flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
+    {
+      MDL_request *schema_request= new (thd->mem_root) MDL_request;
+      if (schema_request == NULL)
+        DBUG_RETURN(TRUE);
+      schema_request->init(MDL_key::SCHEMA, table->db, "",
+                           MDL_INTENTION_EXCLUSIVE,
+                           MDL_TRANSACTION);
+      mdl_requests.push_front(schema_request);
+    }
 
     mdl_requests.push_front(&table->mdl_request);
   }
@@ -4259,22 +4260,6 @@ lock_table_names(THD *thd, const DDL_options_st &options,
 
   if (!(flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
   {
-    /*
-      Scoped locks: Take intention exclusive locks on all involved
-      schemas.
-    */
-    Hash_set<TABLE_LIST>::Iterator it(schema_set);
-    while ((table= it++))
-    {
-      MDL_request *schema_request= new (thd->mem_root) MDL_request;
-      if (schema_request == NULL)
-        DBUG_RETURN(TRUE);
-      schema_request->init(MDL_key::SCHEMA, table->db, "",
-                           MDL_INTENTION_EXCLUSIVE,
-                           MDL_TRANSACTION);
-      mdl_requests.push_front(schema_request);
-    }
-
     /*
       Protect this statement against concurrent global read lock
       by acquiring global intention exclusive lock with statement
@@ -7977,7 +7962,7 @@ bool setup_fields(THD *thd, Item **ref_pointer_array,
   RETURN pointer on pointer to next_leaf of last element
 */
 
-void make_leaves_list(List<TABLE_LIST> &list, TABLE_LIST *tables,
+void make_leaves_list(THD *thd, List<TABLE_LIST> &list, TABLE_LIST *tables,
                       bool full_table_list, TABLE_LIST *boundary)
  
 {
@@ -7993,12 +7978,12 @@ void make_leaves_list(List<TABLE_LIST> &list, TABLE_LIST *tables,
         tables/views were already prepared and has their leaf_tables
         set properly.
       */
-      make_leaves_list(list, select_lex->get_table_list(),
+      make_leaves_list(thd, list, select_lex->get_table_list(),
       full_table_list, boundary);
     }
     else
     {
-      list.push_back(table);
+      list.push_back(table, thd->mem_root);
     }
   }
 }
@@ -8059,7 +8044,7 @@ bool setup_tables(THD *thd, Name_resolution_context *context,
     leaves.empty();
     if (!select_lex->is_prep_leaf_list_saved)
     {
-      make_leaves_list(leaves, tables, full_table_list, first_select_table);
+      make_leaves_list(thd, leaves, tables, full_table_list, first_select_table);
       select_lex->leaf_tables_exec.empty();
     }
     else

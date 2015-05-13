@@ -260,12 +260,15 @@ struct LEX_MASTER_INFO
     my_init_dynamic_array(&repl_ignore_domain_ids,
                           sizeof(ulong), 0, 16, MYF(0));
   }
-  void reset()
+  void reset(bool is_change_master)
   {
-    delete_dynamic(&repl_ignore_server_ids);
-    /* Free all the array elements. */
-    delete_dynamic(&repl_do_domain_ids);
-    delete_dynamic(&repl_ignore_domain_ids);
+    if (unlikely(is_change_master))
+    {
+      delete_dynamic(&repl_ignore_server_ids);
+      /* Free all the array elements. */
+      delete_dynamic(&repl_do_domain_ids);
+      delete_dynamic(&repl_ignore_domain_ids);
+    }
 
     host= user= password= log_file_name= ssl_key= ssl_cert= ssl_ca=
       ssl_capath= ssl_cipher= relay_log_name= 0;
@@ -2787,9 +2790,9 @@ public:
 
   void cleanup_after_one_table_open();
 
-  bool push_context(Name_resolution_context *context)
+  bool push_context(Name_resolution_context *context, MEM_ROOT *mem_root)
   {
-    return context_stack.push_front(context);
+    return context_stack.push_front(context, mem_root);
   }
 
   void pop_context()

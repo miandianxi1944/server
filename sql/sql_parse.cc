@@ -1593,7 +1593,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       break;
     }
     packet= arg_end + 1;
-    mysql_reset_thd_for_next_command(thd);
+    thd->reset_for_next_command();
     lex_start(thd);
     /* Must be before we init the table list. */
     if (lower_case_table_names)
@@ -3364,13 +3364,13 @@ mysql_execute_command(THD *thd)
           select_create is currently not re-execution friendly and
           needs to be created for every execution of a PS/SP.
         */
-        if ((result= new select_create(create_table,
-                                       &create_info,
-                                       &alter_info,
-                                       select_lex->item_list,
-                                       lex->duplicates,
-                                       lex->ignore,
-                                       select_tables)))
+        if ((result= new (thd->mem_root) select_create(thd, create_table,
+                                                       &create_info,
+                                                       &alter_info,
+                                                       select_lex->item_list,
+                                                       lex->duplicates,
+                                                       lex->ignore,
+                                                       select_tables)))
         {
           /*
             CREATE from SELECT give its SELECT_LEX for SELECT,
@@ -3934,13 +3934,14 @@ end_with_restore_list:
       select_lex->context.table_list= 
         select_lex->context.first_name_resolution_table= second_table;
       res= mysql_insert_select_prepare(thd);
-      if (!res && (sel_result= new select_insert(first_table,
-                                                 first_table->table,
-                                                 &lex->field_list,
-                                                 &lex->update_list,
-                                                 &lex->value_list,
-                                                 lex->duplicates,
-                                                 lex->ignore)))
+      if (!res && (sel_result= new (thd->mem_root) select_insert(thd,
+                                                             first_table,
+                                                             first_table->table,
+                                                             &lex->field_list,
+                                                             &lex->update_list,
+                                                             &lex->value_list,
+                                                             lex->duplicates,
+                                                             lex->ignore)))
       {
         if (lex->analyze_stmt)
           ((select_result_interceptor*)sel_result)->disable_my_ok_calls();
@@ -4009,14 +4010,15 @@ end_with_restore_list:
           Actually, it is ANALYZE .. DELETE .. RETURNING. We need to produce
           output and then discard it.
         */
-        sel_result= new select_send_analyze();
+        sel_result= new (thd->mem_root) select_send_analyze(thd);
         replaced_protocol= true;
         save_protocol= thd->protocol;
         thd->protocol= new Protocol_discard(thd);
       }
       else
       {
-        if (!(sel_result= lex->result) && !(sel_result= new select_send()))
+        if (!(sel_result= lex->result) &&
+            !(sel_result= new (thd->mem_root) select_send(thd)))
           return 1;
       }
     }
@@ -4073,7 +4075,8 @@ end_with_restore_list:
 
     if (!thd->is_fatal_error)
     {
-      result= new multi_delete(aux_tables, lex->table_count);
+      result= new (thd->mem_root) multi_delete(thd, aux_tables,
+                                               lex->table_count);
       if (result)
       {
         res= mysql_select(thd, &select_lex->ref_pointer_array,
@@ -5698,7 +5701,7 @@ static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables)
     SELECT_LEX *param= lex->unit.global_parameters();
     if (!param->explicit_limit)
       param->select_limit=
-        new Item_int((ulonglong) thd->variables.select_limit);
+        new (thd->mem_root) Item_int((ulonglong) thd->variables.select_limit);
   }
   if (!(res= open_and_lock_tables(thd, all_tables, TRUE, 0)))
   {
@@ -5710,7 +5713,7 @@ static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables)
         to prepend EXPLAIN to any query and receive output for it,
         even if the query itself redirects the output.
       */
-      if (!(result= new select_send()))
+      if (!(result= new (thd->mem_root) select_send(thd)))
         return 1;                               /* purecov: inspected */
       thd->send_explain_fields(result, lex->describe, lex->analyze_stmt);
         
@@ -5768,14 +5771,14 @@ static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables)
         else 
         {
           DBUG_ASSERT(thd->protocol);
-          result= new select_send_analyze();
+          result= new (thd->mem_root) select_send_analyze(thd);
           save_protocol= thd->protocol;
           thd->protocol= new Protocol_discard(thd);
         }
       }
       else
       {
-        if (!result && !(result= new select_send()))
+        if (!result && !(result= new (thd->mem_root) select_send(thd)))
           return 1;                               /* purecov: inspected */
       }
       query_cache_store_query(thd, all_tables);
@@ -6723,15 +6726,8 @@ bool my_yyoverflow(short **yyss, YYSTYPE **yyvs, ulong *yystacksize)
   (prepared or conventional).  It is not called by substatements of
   routines.
 
-  @todo Remove mysql_reset_thd_for_next_command and only use the
-  member function.
-
   @todo Call it after we use THD for queries, not before.
 */
-void mysql_reset_thd_for_next_command(THD *thd)
-{
-  thd->reset_for_next_command();
-}
 
 void THD::reset_for_next_command()
 {
@@ -7005,7 +7001,7 @@ static void wsrep_mysql_parse(THD *thd, char *rawbuf, uint length,
       if (thd->wsrep_conflict_state == ABORTED ||
           thd->wsrep_conflict_state == CERT_FAILURE)
       {
-        mysql_reset_thd_for_next_command(thd);
+        thd->reset_for_next_command();
         thd->killed= NOT_KILLED;
         if (is_autocommit                           &&
             thd->lex->sql_command != SQLCOM_SELECT  &&
@@ -7101,13 +7097,13 @@ void mysql_parse(THD *thd, char *rawbuf, uint length,
     of (among others) lex->safe_to_cache_query and thd->server_status,
     which are reset respectively in
     - lex_start()
-    - mysql_reset_thd_for_next_command()
+    - THD::reset_for_next_command()
     So, initializing the lexical analyser *before* using the query cache
     is required for the cache to work properly.
     FIXME: cleanup the dependencies in the code to simplify this.
   */
   lex_start(thd);
-  mysql_reset_thd_for_next_command(thd);
+  thd->reset_for_next_command();
 
   if (query_cache_send_result_to_client(thd, rawbuf, length) <= 0)
   {
@@ -7221,7 +7217,7 @@ bool mysql_test_parse_for_slave(THD *thd, char *rawbuf, uint length)
   if (!(error= parser_state.init(thd, rawbuf, length)))
   {
     lex_start(thd);
-    mysql_reset_thd_for_next_command(thd);
+    thd->reset_for_next_command();
 
     if (!parse_sql(thd, & parser_state, NULL, true) &&
         all_tables_not_ok(thd, lex->select_lex.table_list.first))
@@ -7637,7 +7633,7 @@ TABLE_LIST *st_select_lex::nest_last_join(THD *thd)
 void st_select_lex::add_joined_table(TABLE_LIST *table)
 {
   DBUG_ENTER("add_joined_table");
-  join_list->push_front(table);
+  join_list->push_front(table, parent_lex->thd->mem_root);
   table->join_list= join_list;
   table->embedding= embedding;
   DBUG_VOID_RETURN;
@@ -7815,7 +7811,7 @@ push_new_name_resolution_context(THD *thd,
     left_op->first_leaf_for_name_resolution();
   on_context->last_name_resolution_table=
     right_op->last_leaf_for_name_resolution();
-  return thd->lex->push_context(on_context);
+  return thd->lex->push_context(on_context, thd->mem_root);
 }
 
 
@@ -8229,23 +8225,25 @@ Comp_creator *comp_ne_creator(bool invert)
   @return
     constructed Item (or 0 if out of memory)
 */
-Item * all_any_subquery_creator(Item *left_expr,
+Item * all_any_subquery_creator(THD *thd, Item *left_expr,
 				chooser_compare_func_creator cmp,
 				bool all,
 				SELECT_LEX *select_lex)
 {
   if ((cmp == &comp_eq_creator) && !all)       //  = ANY <=> IN
-    return new Item_in_subselect(left_expr, select_lex);
+    return new (thd->mem_root) Item_in_subselect(thd, left_expr, select_lex);
 
   if ((cmp == &comp_ne_creator) && all)        // <> ALL <=> NOT IN
-    return new Item_func_not(new Item_in_subselect(left_expr, select_lex));
+    return new (thd->mem_root) Item_func_not(
+             new (thd->mem_root) Item_in_subselect(thd, left_expr, select_lex));
 
   Item_allany_subselect *it=
-    new Item_allany_subselect(left_expr, cmp, select_lex, all);
+    new (thd->mem_root) Item_allany_subselect(thd, left_expr, cmp, select_lex,
+                                              all);
   if (all)
-    return it->upper_item= new Item_func_not_all(it);	/* ALL */
+    return it->upper_item= new (thd->mem_root) Item_func_not_all(it); /* ALL */
 
-  return it->upper_item= new Item_func_nop_all(it);      /* ANY/SOME */
+  return it->upper_item= new (thd->mem_root) Item_func_nop_all(it);   /* ANY/SOME */
 }
 
 

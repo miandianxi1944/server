@@ -407,7 +407,7 @@ bool mysql_derived_merge(THD *thd, LEX *lex, TABLE_LIST *derived)
     if (!derived->get_unit()->prepared)
     {
       dt_select->leaf_tables.empty();
-      make_leaves_list(dt_select->leaf_tables, derived, TRUE, 0);
+      make_leaves_list(thd, dt_select->leaf_tables, derived, TRUE, 0);
     } 
 
     derived->nested_join= (NESTED_JOIN*) thd->calloc(sizeof(NESTED_JOIN));
@@ -660,7 +660,7 @@ bool mysql_derived_prepare(THD *thd, LEX *lex, TABLE_LIST *derived)
 
   unit->derived= derived;
 
-  if (!(derived->derived_result= new select_union))
+  if (!(derived->derived_result= new (thd->mem_root) select_union(thd)))
     DBUG_RETURN(TRUE); // out of memory
 
   lex->context_analysis_only|= CONTEXT_ANALYSIS_ONLY_DERIVED;

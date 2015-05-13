@@ -156,7 +156,7 @@ int Explain_query::send_explain(THD *thd)
   select_result *result;
   LEX *lex= thd->lex;
  
-  if (!(result= new (thd->mem_root) select_send()) || 
+  if (!(result= new (thd->mem_root) select_send(thd)) || 
       thd->send_explain_fields(result, lex->describe, lex->analyze_stmt))
     return 1;
 
@@ -1191,7 +1191,7 @@ const char *String_list::append_str(MEM_ROOT *mem_root, const char *str)
   if (!(cp = (char*)alloc_root(mem_root, len+1)))
     return NULL;
   memcpy(cp, str, len+1);
-  push_back(cp);
+  push_back(cp, mem_root);
   return cp;
 }
 
